@@ -1,118 +1,219 @@
 ---
-name: xvgtracer
-description: Build and extend XVGTracer — a color image to layered/editable SVG tracer using Pillow quantization + per-color contour tracing. Use when tracing raster images into vector SVG layers, adding BiRefNet matting, or wiring the FastAPI + SvelteKit app.
+name: xvgtracer-learning-v2
+description: SVG reconstruction via curvature-based classification, RDP convergence points, and per-segment LSQ cubic bezier fitting. Use when building or extending the learning_v2 pipeline for shape classification, contour analysis, bezier approximation, or evaluating reconstruction quality.
 ---
 
-# XVGTracer Skill
+# learning_v2 — Curvature-based SVG reconstruction
 
-XVGTracer converts a raster image into a **layered, editable SVG** — one `<g>` group per
-dominant color, each traced into vector paths (marching-squares + spline-smoothed curves).
+A self-contained pipeline (zero imports from `learning/`) that takes a quantized raster image and produces an SVG with one `<path>` per dominant color region. Instead of templated primitive matching, it classifies each region's coarse geometry from its **RDP-simplified turning signature**, finds **convergence points** (corners / curvature extrema), and fits cubic bezier segments per span — producing smooth, compact paths for every shape family.
 
-## When to use
-- User wants to vectorize / trace an image into SVG with separate color layers.
-- User mentions XVGTracer, color-trace, potrace, image-to-SVG, or editable vector layers.
-- Extending the POC: BiRefNet matting, real Potrace Béziers, SVGO optimization.
+## Pipeline overview
 
-## Project layout
-- `xvgtracer.py` — core. `quantize()`, `_binary_mask_for_color()`, `trace_layer()` (marching-squares + spline smoothing), `generate_svg()`, `process()`.
-- `learning/` — learning **package** (`from learning import learner`).
-  - `learner.py` — orchestrator. `learn_image()` (full pipeline), `model_to_svg()`, `identify_shape()` / `rebuild_shape()` (delegates to `svg_renderer._node_d`) / `detect_overlaps()` public wrappers, `save_model()`/`load_model()`.
-  - `classifiers/` — **mask→node logic**. `mask_classifier.classify_mask()` (repair → extent → best-fit IoU → star → rotated → polygon fallback), `_fit_rotated_primitive()`, `estimate_orientation()`, `build_transform()` (single owner of rotate-Transform attachment).
-  - `shape_registry.py` — vocabulary (`PRIMITIVES/COMPOSITES/TRANSFORMS`), primitive→reconstructor map, shared `fit_candidates()` IoU-ranking helper, `register()` bookkeeping.
-  - `composites.py` — `build_composites()`: overlap records → `difference`/`union` composite nodes.
-  - `metrics/` — `iou` (mask/polygon IoU, coverage), `contour_error` (mean/rms/max), `hausdorff`. Pure geometry.
-  - `detectors/` — `contour_detector` (marching-squares → (x,y) ring + gap/hole repair), `edge_detector` (mask repair, Gaussian smoothing, Sobel edges), `component_detector` (mask extent, components, `is_background`, centroid).
-  - `generators/` — `circle`, `rectangle` (+rounded), `ellipse`, `polygon` (+triangle/star/regular): each builds candidate point lists.
-  - `reconstructors/` — `primitive_reconstructor` (point/circle/ellipse/arc/line/rect/rounded_rect → `d`), `polygon_reconstructor` (triangle/polygon/star → `d`), `bezier_reconstructor` (explicit cubic or Catmull-Rom smooth).
-  - `renderers/` — `raster_renderer` (`rasterize_polygon`, `rasterize_node` — shared mask backend), `svg_renderer` (`model_to_svg`, `_node_d`, `transform_to_svg`).
-- `tests/` — synthetic test images (`clean_shapes.png`, `transform_shapes.png`) + fixtures.
-- `api.py` — FastAPI: `POST /trace` (multipart: `image`, `num_colors`, `simplify`, `angle_threshold`, `smooth_sigma`) → SVG; `POST /learn` (multipart: `image`, `num_colors`) → `{model, svg, summary}`; `GET /health`.
-- `frontend/` — SvelteKit. `src/routes/+page.svelte` handles upload, inline `{@html svg}`, layer checkboxes, **Learn** button (calls `/api/learn`), SVGO, download. Vite proxies `/api` → `:8000`.
-
-## Tracing engine (single)
-- `trace_layer()` (skimage `find_contours` marching-squares) → `_rdp` → `_to_smooth_path`.
-  **Potrace was evaluated and dropped**: the `potracer` pure-Python port is buggy
-  (rects→diamonds, triangles→under-filled kites, IoU ~0.5) and `pypotrace` can't build
-  here (needs libagg/pkg-config). The marching-squares path with spline smoothing
-  reliably traces all shapes (per-layer IoU 0.95–0.97 on test images).
-
-## Learning system (`learner.py` + package)
-Goal: turn each color mask into a **node hierarchy** that is editable/structured:
 ```
-Primitive : point | line | circle | ellipse | rect | rounded_rect |
-            triangle | polygon(N) | bezier | arc
-Composite : union(A,B) | difference(A,B) | intersection(A,B) | xor(A,B)
-Transform : translate | rotate | scale | skew | mirror   (attached to a node)
+quantize image (Pillow FASTOCTREE + k-means)
+  → for each non-background color:
+      binary mask → contour ring
+      → family decision (smooth / polygon / star / blob)
+      → convergence points (RDP-signature run detection)
+      → per-segment line/curve classification
+      → bezier or line path assembly
+  → SVG
 ```
-`learner.learn_image()` orchestrates three stages across the package:
-1. **identify** — `classifiers.mask_classifier.classify_mask()` repairs the mask (`detectors.edge_detector.repair_mask`,
-   gap-close + hole-fill, robust to anti-aliased quantization) → `detectors.component_detector.mask_extent`
-   (true pixel extent, not the largest contour, which can fragment). Detection order: **triangle** (clean 3-corner fit,
-   confirmed by re-rasterised IoU so stars are rejected) → **star** (strictly-alternating radial tips/valleys on the
-   raw contour, via angle-binned radii) → best-fit IoU via `shape_registry.fit_candidates` over candidates
-    (circle/ellipse/rect/rounded_rect/triangle); `rounded_rect` wins when its IoU beats `rect`. When a star is
-    detected, `classify_mask` runs BOTH `_star_vertices` (angle-binned tip maxima, de-duplicated by angular
-    separation, valleys via windowed-min at the mid-angle) and `_star_vertices_angle` (pure angle-space local
-    maxima with 30° spacing + min-radius gap valleys) and keeps whichever re-rasterises with higher IoU. The
-    `_detect_star` guard requires ≥5 significant radial maxima (rmin + 0.25·range) so a clipped circle (one
-    overlap-notch) is NOT mis-classified as a star. Rotated rects/ellipses are
-   caught by `_fit_rotated_primitive()` (min-area-rectangle orientation search → de-rotate → re-fit → `rotate`
-   Transform node); everything else → `polygon`. `build_transform()` is the single owner of rotate-Transform attachment.
-   Gotcha: the `rounded_rectangle_points` generator must use **radians** for its corner arcs (a degree/radian bug
-   previously made rounded-rect rasterise to a thin ring).
- 2. **rebuild** — `learner.rebuild_shape()` delegates to `renderers.svg_renderer._node_d`, which dispatches to
-    `reconstructors/` (`primitive_reconstructor` for circle/ellipse/rect/rounded_rect/arc/line/point,
-    `polygon_reconstructor` for polygon/star/triangle, `bezier_reconstructor` for cubic/Bezier).
- 3. **postprocess** — `learner.detect_overlaps()` rasterises each shape via `renderers.raster_renderer`
-    and records pairwise IoU. `composites.build_composites()` builds **composite** nodes: `keep_topmost` → `difference`,
-    `contained` → `union`. Background layers (>60% of frame, via `is_background`) excluded.
-    `renderers.svg_renderer.transform_to_svg()` renders attached Transform nodes.
-    **Composite SVG rendering**: the `model_to_svg` renderer does NOT paint a composite as one flat group colour.
-    Instead it emits each child as its own z-ordered, coloured `<path>` (bottom first, top last) and skips the
-    standalone draw of composite members. This keeps every shape's colour and makes the overlap show the top
-    shape's colour (natural overpainting) — so `difference`/`union` both look correct rather than flattening to
-    the top colour. (Earlier versions used a single evenodd path that punched holes to the background.)
 
-Key gotchas (learned the hard way):
-- `find_contours` returns **(row, col)**; `detectors.contour_detector` swaps to **(x, y)** for drawing.
-- Anti-aliased masks fragment into multiple contours → never trust `max(contours, key=len)` for bbox;
-  use `mask_extent` on raw mask pixels. Repair with `binary_closing` before fitting so edge gaps don't
-  penalise primitive IoU.
-- Rotated-rectangle PCA orientation is unreliable; `shape_registry.estimate_orientation` uses a
-  min-area-rectangle angle search instead.
-- Keep the package dependency direction acyclic: `metrics` ← `detectors`/`generators` ←
-  `reconstructors`/`renderers` ← `shape_registry` ← `learner`. `learner`/`shape_registry` import from
-  the sub-packages; sub-packages never import `learner`.
+## File layout
 
-## Key implementation notes
-- Quantization: `Image.quantize(colors=N, method=Image.FASTOCTREE, kmeans=N)` then read palette
-  from the **P-mode** image BEFORE `.convert("RGB")` (converting drops the palette).
-- Contour tracing uses skimage `measure.find_contours(mask, 0.5)` (marching squares).
-- Simplification: `_rdp()` is a **closed-contour-aware** Ramer–Douglas–Peucker. For closed
-  loops, first split at the farthest point pair (else a circle collapses to 2 points). Use the
-  2D perpendicular-distance formula `|rel_x*vec_y - rel_y*vec_x| / norm` — numpy `cross` is 3D only.
-- `simplify` param = RDP epsilon in pixels (default 2.0). Higher = fewer path points.
-- `smooth_sigma` (px, default 1.0): low-pass on the **contour point ring** before tracing
-  (NOT image blur — blur drifts the boundary and worsens shape error). Kills grid jitter
-  that causes "polygonal hints". Higher = smoother but can round micro-details.
-- `angle_threshold` (deg, default 30) = spline corner sensitivity. `_to_smooth_path()`
-  classifies each vertex by its *exterior bend angle* (180° = straight, small = sharp).
-  Vertices bending more than `angle_threshold` from straight become hard corners (`L`);
-  gentler runs become cubic Béziers via Catmull-Rom→Bézier. So circles/arcs curve,
-  rectangles/stars stay crisp. NOTE: turn is measured as `180 - angle`, not the raw angle.
-- Output: each layer `<g id="layer_i" data-color="rgb(...)" fill-rule="evenodd">`.
+- `learning_v2/__init__.py` — all classification + path building + SVG generation (~570 lines)
+- `learning_v2/_image.py` — image processing (quantize, mask, contour)
+- `learning_v2/testkit/` — reusable shape generators + SVG eval utilities
+  - `_gen.py` — `polygon`, `star`, `ellipse_pts`, `blob`, `lens_lune_pts`, `generate_shapes`, `render_ground_truth`
+  - `_eval.py` — `render_svg`, `label_predicted_pixels`, `compute_iou`, `evaluate_svg`
+- `learning_v2/__main__.py` — CLI: `python -m learning_v2 <image.png> [n_colors] [--svg]`
+- `tests/eval.py` — IoU evaluation against ground-truth primitives
+- `tests/primitives.png` — 800×800 test image with 12 labeled shapes
 
-## Run
+## Reusable test features (`testkit/`)
+
+**Shape generators** (`learning_v2.testkit._gen`):
+
+**Shape generators** (programmatic point lists for creating test images):
+- `polygon(cx, cy, r, n, rot=0)` — regular polygon
+- `star(cx, cy, r, n_points)` — alternating-tip star
+- `ellipse_pts(cx, cy, w, h, n=60)` — ellipse outline
+- `blob(cx, cy, r, n=60, amp=0.15, freq=4)` — organic undulating shape
+- `lens_lune_pts(cx, cy, r, offset, n=60, lens=True)` — intersecting-circle lens/lune
+
+**Standard benchmark** (12-shape test suite covering all families):
+- `generate_shapes()` — returns list of `{type, pts, color}` dicts matching the standard layout
+- `render_ground_truth(width=800, height=800, shapes=None)` — PIL image from shape dicts
+- `SHAPE_DEFS`, `IRREGULAR_PTS`, `CONCAVE_PTS` — layout constants for custom benches
+
+**SVG evaluation pipeline**:
+- `render_svg(svg_path, out_png, resvg="")` — rasterize SVG to PNG via resvg
+- `label_predicted_pixels(pred_rgb, gt_colors, max_color_dist=30)` — color → nearest-class label map
+- `compute_iou(gt_mask, pred_mask)` — single-shape IoU from binary masks
+- `evaluate_svg(svg_path, gt_image_path, gt_json_path, resvg="")` — full eval returning per-shape + overall IoU
+
+Usage:
+```python
+from learning_v2.testkit import evaluate_svg, generate_shapes, render_ground_truth
+results = evaluate_svg("my_output.svg", "ground_truth.png", "ground_truth.json")
+print(results["overall"])
+```
+
+## Standard 12-shape test
+
+Generated by `tests/gen_primitives.py` (now a thin wrapper around `learning_v2.testkit`). Layout positions:
+
+## Shape families (classify_shape)
+
+Decision tree based on the **RDP-simplified turn signature** (`_simplified_signature`):
+
+1. **smooth** — `max_turn < 0.5`: circle/ellipse-like, no sharp corners
+2. **polygon** — `n_sign <= 2` (all turns same sign): convex/gentle shapes with corners
+   - `n_strong >= 2`: regular polygon (triangle, rect, pentagon, hexagon)
+   - `n_low >= 2 and n_high >= 2`: lune/lens/irregular with mixed turn magnitudes → polygon
+   - else: smooth (catches ellipse, circle)
+3. **star** — `global_var >= 0.05 and n_peaks >= 6`: alternating turn signs + high variance
+4. **blob** — `n_peaks >= 8 and global_var < 0.05`: many small undulations, low variance
+5. **fallback** — polygon
+
+### RDP signature parameters
+
+- Epsilon: `max(1.0, 0.012 × shape_diag)`
+- `max_turn`: max RDP vertex turn magnitude
+- `n_peaks`: count of RDP turns > 0.35 rad
+- `global_var`: variance of RDP turn magnitudes
+- `n_sign`: sign alternations in the RDP turn sequence
+- `n_strong`: count of RDP turns > 0.8 rad
+- Low/high thresholds for outlier detection: `n_low` (turns < 0.4), `n_high` (turns > 0.5)
+
+## Convergence points (find_convergence_points)
+
+Two-threshold run detection on the RDP turn signature:
+
+1. Find runs of vertices with turn > **0.35 rad** (angle_thresh)
+2. If any vertex in a run exceeds **0.5 rad** (high_thresh), **keep all** vertices in that run (captures irregular/concave/blobs precisely)
+3. Otherwise (run entirely between 0.35–0.5), keep only the **max-turn** vertex per run (reduces arc artifacts)
+4. Dedup nearby RDP vertices (`min_dist_sig = 1` on signature grid)
+5. Map each RDP vertex to nearest original ring contour index
+6. **Strength-based merge**: when two candidates are within `max(5.0, 0.14 × diag)` pixels, keep the one with higher RDP turn strength
+7. Returns `List[(index, strength)]` — sorted, deduplicated
+
+### 2-CP reduction (build_lc_path)
+
+If exactly 2 convergence points have RDP strength > 0.8 **and** total CPs ≤ 5, reduce to only those 2 (collapses lune/lens to 2-curve segments). Works with midpoint-split bezier to maintain accuracy.
+
+## Per-segment classification (classify_segment)
+
+For each span between adjacent convergence points, classify as **line** or **curve**:
+
+- Compute perpendicular deviation of midpoint contour from the chord
+- `line_dev = 0.12`: relative deviation threshold (deviation / chord length)
+- If all contour points are within `line_dev × chord` of the chord → **line**, else → **curve**
+
+Used only for polygon-family; for smooth (arc fit), blob (spline), and uniform-curvature polygon shapes (n_sign ≤ 2, n_strong < 2), all segments are forced to "curve".
+
+## Path assembly (to_path)
+
+Five rendering paths:
+
+### 1. Smooth family (no convergence)
+- Fit LSQ circle (`_fit_circle_lsq`) or ellipse (`_fit_ellipse_lsq`)
+- Emit two `A` (arc) commands for circles, two `A` commands with rotation for ellipses
+
+### 2. Blob family
+- Always use Catmull-Rom spline (`_spline_path`) through ~24 evenly-subsampled contour points
+- Produces smooth organic curves with many bezier segments
+
+### 3. Uniform-curvature polygon (ellipse/lune/lens)
+- Force all segments to "curve" (bezier)
+- Uses convergence points as segment boundaries
+
+### 4. Polygon family (general)
+- Per segment: line → `L` command, curve → `C` command
+- **Midpoint splitting**: if a curve segment has >20 contour points, split at the midpoint and fit 2 beziers (each covers ~90° of arc instead of 180° — critical for accurate bezier approximation of long arcs)
+
+### 5. Star / regular polygon
+- All segments are line type → pure `L` (straight edges), `Z` close
+
+## Bezier fitting (LSQ cubic)
+
+`_fit_bezier_lsq`: fits control points P1, P2 for a segment from p0 to p3:
+
+- Chord-length parameterization for t-values along contour points
+- Solves `A * [P1, P2] = B` via `np.linalg.lstsq`:
+  - `A = [3(1-t)²t, 3(1-t)t²]`
+  - `B = pts - ((1-t)³p0 + t³p3)`
+- Returns `(c1x, c1y, c2x, c2y)` or None (degenerate segment)
+
+### Catmull-Rom spline (_spline_path)
+
+Fallback for blob when <3 convergence points (or forced for all blobs):
+- For each vertex k: uses `p(k-1), p(k), p(k+1), p(k+2)` to compute bezier control points
+- `c1 = p(k) + (p(k+1) - p(k-1)) / 6`
+- `c2 = p(k+1) - (p(k+2) - p(k)) / 6`
+- Produces G1-continuous cubic bezier spline
+
+## Smooth shape fitting
+
+### Circle (`_fit_circle_lsq`)
+LSQ circle fit via Kåsa method: moment-based solution for `(cx, cy, r)` from all contour points.
+
+### Ellipse (`_fit_ellipse_lsq`)
+Direct least-squares ellipse fit (Fitzgibbon 1999 algebraic method). Returns `(cx, cy, rx, ry, angle)`. Used when the smooth family ring fails circle check and has aspect ratio > 1.05.
+
+## Image processing (`_image.py`)
+
+- `quantize_image(path, num_colors)`: Pillow `FASTOCTREE` + k-means → palette + indexed image
+- `extract_masks(indexed, palette, bg_idx)`: per-color binary masks + contour rings
+- `contour_vertices(mask, fill_holes)`: skimage `find_contours(0.5)` → largest contour → gap repair via `binary_closing`
+- Uses `repair_mask` (binary closing for edge gaps) before contour extraction
+
+## Evaluation (`tests/eval.py`)
+
+- Renders SVG with `resvg` at 800×800
+- Pixels are color-labeled: predicted color vs ground-truth color
+- Color matching by nearest Euclidean distance in RGB space
+- Per-shape IoU reported; overall = macro average
+
+## Best-known scores (primitives.png, 13-color quantize)
+
+| Shape    | IoU   |
+|----------|-------|
+| circle   | 0.949 |
+| triangle | 0.984 |
+| rect     | 0.980 |
+| pentagon | 0.979 |
+| hexagon  | 0.972 |
+| star     | 0.958 |
+| irregular| 0.990 |
+| concave  | 0.941 |
+| blob     | 0.979 |
+| ellipse  | 0.974 |
+| lune     | 0.963 |
+| lens     | 0.978 |
+| **Overall** | **0.971** |
+
+## CLI
+
 ```bash
-pip install pillow numpy scikit-image scipy fastapi uvicorn
-python -m learning.learner tests/clean_shapes.png 8                    # CLI -> _learned.json + .svg
-uvicorn api:app --reload --port 8000                        # API (/trace + /learn)
-cd frontend && npm install && npm run dev                   # UI
+python -m learning_v2 tests/primitives.png 13 --svg
+python tests/eval.py
 ```
 
-## Upgrade paths
-- **Better curves**: improve `_to_smooth_path` tight Béziers / arc fitting (no Potrace — see above).
-- **Composite inference**: add `intersection`/`xor` detection from overlap geometry (node types exist).
-- **Clean foreground**: run BiRefNet matting first, trace only foreground layers.
-- **Better colors**: OKLab / pngquant instead of median-cut.
-- **Optimization**: server-side SVGO (svgwrite) instead of the client regex pass.
+Args: `<image>` `[n_colors=8]` `[--svg]`
+
+- Without `--svg`: prints JSON results per color component
+- With `--svg`: writes `tests/primitives.svg`
+
+## Key gotchas
+
+- **RDP epsilon** controls the level of detail: `0.012 × diag` works well for family decision (aggressive enough to remove staircasing, gentle enough to preserve coarse shape)
+- **Two-threshold runs** (0.35/0.5) are critical: single-threshold at 0.5 misses features on irregular/concave shapes
+- **Strength-based merge** prevents CP clustering while keeping strongest features
+- **Midpoint splitting** prevents cubic bezier from failing on 180° arcs (a single cubic bezier can't accurately represent >120° of a circular arc)
+- **Blob via spline** (~24 subsampled points) gives better IoU than bezier-per-convergence-segment
+- **Ellipse needs all-curve override**: the polygon family classifies some segments as "line" creating facets; override seg_types for n_sign ≤ 2, n_strong < 2 shapes
+- **3-point arc fit** (`_segment_arc`) is less accurate than LSQ bezier for pixelized contours — the current code uses `C` commands exclusively for curve segments
+- `find_contours` returns (row, col) → convert to (x, y)
+- Color quantization may merge distinct primitives into the same color if too few colors requested

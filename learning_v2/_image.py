@@ -5,6 +5,16 @@ from typing import List, Tuple
 import numpy as np
 from PIL import Image
 
+__all__ = [
+    "Point",
+    "components",
+    "components_merged",
+    "contour_vertices",
+    "mask_for_color",
+    "quantize",
+    "repair_mask",
+]
+
 Point = Tuple[float, float]
 
 

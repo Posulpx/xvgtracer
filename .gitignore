@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.svg
+*.png
+*.json

@@ -1,7 +1,9 @@
+"""Diagnostic: dump CP d/chord ratios for blob and lens."""
+
 import sys, json, math
 sys.path.insert(0, '.')
 from learning_v2 import quantize, mask_for_color, components_merged, contour_vertices, repair_mask
-from learning_v2.__init__ import _closed_ring, find_convergence_points, build_lc_path
+from learning_v2 import _closed_ring, find_convergence_points, build_lc_path
 import numpy as np
 
 img, cols = quantize('tests/primitives.png', 13)
